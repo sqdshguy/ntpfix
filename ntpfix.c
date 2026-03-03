@@ -169,9 +169,18 @@ static HANDLE               g_hStopEvent = NULL;
 static CRITICAL_SECTION     g_cs;
 static BOOL                 g_hasSample  = FALSE;
 static TimeSample           g_sample;
-static TpcGetSamplesArgs    g_sampleArgs;
 static WCHAR                g_wzDllPath[MAX_PATH];
 static int                  g_serverIdx  = 0;
+
+/* Debug logging to Windows Event Log */
+static void dbg_log(const WCHAR *msg) {
+    HANDLE hLog = RegisterEventSourceW(NULL, L"NtpFix");
+    if (hLog) {
+        const WCHAR *msgs[1] = { msg };
+        ReportEventW(hLog, EVENTLOG_INFORMATION_TYPE, 0, 0, NULL, 1, 0, msgs, NULL);
+        DeregisterEventSource(hLog);
+    }
+}
 
 #define NTPFIX_POLL_SEC     64   /* poll every 64 seconds */
 #define NTPFIX_TIMEOUT_MS   5000
@@ -267,6 +276,12 @@ static DWORD WINAPI PollThread(LPVOID param) {
         DWORD   refid;
 
         if (ntp_query(&offset, &delay, &dispersion, &stratum, &refid, &leap)) {
+            WCHAR msg[256];
+            _snwprintf(msg, 256,
+                L"NTP OK: offset=%I64d delay=%I64d disp=%I64d stratum=%d refid=0x%08X",
+                offset, delay, dispersion, stratum, ntohl(refid));
+            dbg_log(msg);
+
             EnterCriticalSection(&g_cs);
 
             memset(&g_sample, 0, sizeof(g_sample));
@@ -278,24 +293,16 @@ static DWORD WINAPI PollThread(LPVOID param) {
             g_sample.nStratum     = stratum;
             g_sample.nLeapFlags   = leap;
             g_sample.dwTSFlags    = 0;
-
-            /* These opaque values are required by w32time */
-            g_sc.pfnGetTimeSysInfo(TSI_TickCount,   &g_sample.nSysTickCount);
-            g_sc.pfnGetTimeSysInfo(TSI_PhaseOffset,  &g_sample.nSysPhaseOffset);
-
             wcscpy(g_sample.wszUniqueName, L"NtpFix:time.google.com");
-
-            /* Set up the sample args for TPC_GetSamples */
-            g_sampleArgs.pbSampleBuf      = (BYTE *)&g_sample;
-            g_sampleArgs.cbSampleBuf      = sizeof(TimeSample);
-            g_sampleArgs.dwSamplesReturned  = 1;
-            g_sampleArgs.dwSamplesAvailable = 1;
             g_hasSample = TRUE;
 
             LeaveCriticalSection(&g_cs);
 
             /* Tell w32time we have a fresh sample */
+            dbg_log(L"Calling AlertSamplesAvail");
             g_sc.pfnAlertSamplesAvail();
+        } else {
+            dbg_log(L"NTP query failed (timeout or bad response)");
         }
 
         /* Wait for stop event or poll interval */
@@ -329,6 +336,8 @@ HRESULT __stdcall TimeProvOpen(WCHAR *wszName, TimeProvSysCallbacks *pSysCallbac
     g_hThread = CreateThread(NULL, 0, PollThread, NULL, 0, NULL);
 
     *phTimeProv = (TimeProvHandle)1;
+
+    dbg_log(L"TimeProvOpen: NtpFix loaded, poll thread started");
     return S_OK;
 }
 
@@ -339,15 +348,31 @@ HRESULT __stdcall TimeProvCommand(TimeProvHandle hTimeProv, TimeProvCmd eCmd,
 
     switch (eCmd) {
     case TPC_GetSamples:
-        EnterCriticalSection(&g_cs);
-        if (g_hasSample && pvArgs) {
-            CopyMemory(pvArgs, &g_sampleArgs, sizeof(TpcGetSamplesArgs));
-        } else if (pvArgs) {
-            TpcGetSamplesArgs *args = (TpcGetSamplesArgs *)pvArgs;
-            args->dwSamplesReturned  = 0;
-            args->dwSamplesAvailable = 0;
+        if (pvArgs) {
+            TpcGetSamplesArgs *pArgs = (TpcGetSamplesArgs *)pvArgs;
+            EnterCriticalSection(&g_cs);
+            if (g_hasSample && pArgs->pbSampleBuf &&
+                pArgs->cbSampleBuf >= sizeof(TimeSample)) {
+                /* Refresh tick count and phase offset to NOW so w32time
+                   doesn't reject the sample as stale */
+                g_sc.pfnGetTimeSysInfo(TSI_TickCount,    &g_sample.nSysTickCount);
+                g_sc.pfnGetTimeSysInfo(TSI_PhaseOffset,  &g_sample.nSysPhaseOffset);
+
+                /* Copy sample into w32time's pre-allocated buffer */
+                CopyMemory(pArgs->pbSampleBuf, &g_sample, sizeof(TimeSample));
+                pArgs->dwSamplesReturned  = 1;
+                pArgs->dwSamplesAvailable = 1;
+
+                dbg_log(L"TPC_GetSamples: returned 1 sample");
+            } else {
+                pArgs->dwSamplesReturned  = 0;
+                pArgs->dwSamplesAvailable = 0;
+                dbg_log(g_hasSample
+                    ? L"TPC_GetSamples: buffer too small or NULL"
+                    : L"TPC_GetSamples: no sample available yet");
+            }
+            LeaveCriticalSection(&g_cs);
         }
-        LeaveCriticalSection(&g_cs);
         break;
 
     case TPC_TimeJumped:

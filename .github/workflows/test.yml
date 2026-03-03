@@ -98,21 +98,38 @@ jobs:
         shell: powershell
         run: |
           Write-Host "=== Waiting for NtpFix to produce samples ===" -ForegroundColor Cyan
-          # Poll every 10 seconds for up to 2 minutes
-          $maxAttempts = 12
+
+          # Check NtpFix event log entries to confirm DLL loaded
+          Start-Sleep -Seconds 5
+          Write-Host "  NtpFix event log entries:"
+          Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='NtpFix']]]" -MaxEvents 10 -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "    $($_.TimeCreated): $($_.Message)"
+          }
+
+          # Poll every 10 seconds for up to 3 minutes
+          $maxAttempts = 18
           $synced = $false
           for ($i = 1; $i -le $maxAttempts; $i++) {
               Start-Sleep -Seconds 10
               $status = w32tm /query /status 2>&1
               $source = ($status | Select-String "Source:") -as [string]
-              Write-Host "  Attempt $i/$maxAttempts - $source"
+              $stratumLine = ($status | Select-String "Stratum:") -as [string]
+              Write-Host "  Attempt $i/$maxAttempts - $source | $stratumLine"
               if ($source -match "NtpFix") {
                   $synced = $true
                   break
               }
           }
+
+          # Show NtpFix logs regardless
+          Write-Host ""
+          Write-Host "  NtpFix event log entries after wait:"
+          Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='NtpFix']]]" -MaxEvents 20 -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "    $($_.TimeCreated): $($_.Message)"
+          }
+
           if (-not $synced) {
-              Write-Host "  WARNING: Source not yet NtpFix, checking debug log..." -ForegroundColor Yellow
+              Write-Host "  WARNING: Source not yet NtpFix after $maxAttempts attempts" -ForegroundColor Yellow
           }
 
       - name: Verify NtpFix integration
@@ -180,6 +197,7 @@ jobs:
         if: failure()
         shell: powershell
         run: |
+          $ErrorActionPreference = "Continue"
           Write-Host "=== Debug info ===" -ForegroundColor Yellow
           w32tm /query /status /verbose
           Write-Host ""
@@ -187,9 +205,11 @@ jobs:
           Write-Host ""
           w32tm /query /peers
           Write-Host ""
-          Get-WinEvent -LogName System -FilterXPath "*[System[Provider[@Name='Microsoft-Windows-Time-Service']]]" -MaxEvents 20 | Format-List TimeCreated, Message
+          Write-Host "=== Time Service events ===" -ForegroundColor Yellow
+          Get-WinEvent -LogName System -FilterXPath "*[System[Provider[@Name='Microsoft-Windows-Time-Service']]]" -MaxEvents 20 -ErrorAction SilentlyContinue | Format-List TimeCreated, Message
           Write-Host ""
-          Get-WinEvent -LogName "Microsoft-Windows-Time-Service/Operational" -MaxEvents 20 -ErrorAction SilentlyContinue | Format-List TimeCreated, Message
+          Write-Host "=== NtpFix events ===" -ForegroundColor Yellow
+          Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='NtpFix']]]" -MaxEvents 30 -ErrorAction SilentlyContinue | Format-List TimeCreated, Message
 
       - name: Upload DLL artifact
         if: always()
