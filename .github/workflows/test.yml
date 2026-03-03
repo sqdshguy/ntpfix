@@ -50,11 +50,77 @@ jobs:
           if ($port -le 1024) { Write-Error "Used low port"; exit 1 }
           Write-Host "  PASS: NTP works from ephemeral port" -ForegroundColor Green
 
-      - name: Check w32time baseline
+      - name: Simulate ISP port block
+        shell: powershell
+        run: |
+          Write-Host "=== Simulating ISP NTP reflection DDoS filter ===" -ForegroundColor Cyan
+          Write-Host "  Blocking outbound UDP from source port 123" -ForegroundColor Yellow
+          Write-Host "  (Reproduces Vinteleport AS24945 behavior)"
+
+          # Block outbound UDP from local port 123 — this is what the ISP does:
+          # drops packets where src_port=123, which kills w32time's built-in NtpClient
+          netsh advfirewall firewall add rule name="SimulateISP-BlockNTP123" `
+            dir=out protocol=udp localport=123 action=block | Out-Host
+
+          # Verify the rule exists
+          netsh advfirewall firewall show rule name="SimulateISP-BlockNTP123" | Out-Host
+
+          # Prove it works: NTP from port 123 should now fail
+          Write-Host ""
+          Write-Host "  Testing NTP from port 123 (should fail)..." -ForegroundColor Yellow
+          $blocked = $false
+          try {
+              $udp = New-Object System.Net.Sockets.UdpClient(123)
+              $udp.Client.ReceiveTimeout = 3000
+              $packet = [byte[]]::new(48)
+              $packet[0] = 0x23
+              $udp.Send($packet, 48, "216.239.35.8", 123) | Out-Null
+              $ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+              try {
+                  $resp = $udp.Receive([ref]$ep)
+                  $blocked = $false
+              } catch {
+                  $blocked = $true
+              }
+              $udp.Close()
+          } catch {
+              # Can't bind to 123 (w32time holds it) — also proves the point
+              $blocked = $true
+              Write-Host "    (Port 123 in use by w32time, also proves the block)" -ForegroundColor DarkGray
+          }
+
+          if ($blocked) {
+              Write-Host "  PASS: NTP from port 123 is blocked" -ForegroundColor Green
+          } else {
+              Write-Host "  FAIL: NTP from port 123 still works!" -ForegroundColor Red
+              exit 1
+          }
+
+          # Prove ephemeral port still works (NtpFix's approach)
+          Write-Host ""
+          Write-Host "  Testing NTP from ephemeral port (should still work)..." -ForegroundColor Yellow
+          $udp2 = New-Object System.Net.Sockets.UdpClient
+          $udp2.Client.ReceiveTimeout = 5000
+          $packet2 = [byte[]]::new(48)
+          $packet2[0] = 0x23
+          $udp2.Send($packet2, 48, "216.239.35.8", 123) | Out-Null
+          $ep2 = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+          $resp2 = $udp2.Receive([ref]$ep2)
+          $port2 = $udp2.Client.LocalEndPoint.Port
+          $udp2.Close()
+
+          if ($resp2.Length -eq 48) {
+              Write-Host "  PASS: NTP from ephemeral port $port2 works through the block" -ForegroundColor Green
+          } else {
+              Write-Host "  FAIL: Ephemeral port NTP also broken" -ForegroundColor Red
+              exit 1
+          }
+
+      - name: Check w32time baseline (with port block active)
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
-          Write-Host "=== w32time status before NtpFix ===" -ForegroundColor Cyan
+          Write-Host "=== w32time status with ISP block active ===" -ForegroundColor Cyan
           net start w32time 2>&1 | Out-Host
           w32tm /query /status
           w32tm /query /configuration | Select-String "NtpClient|NtpServer|Enabled|Type|NtpServer|VMICTime"
@@ -98,6 +164,7 @@ jobs:
         shell: powershell
         run: |
           Write-Host "=== Waiting for NtpFix to produce samples ===" -ForegroundColor Cyan
+          Write-Host "  (Port 123 block is still active — NtpFix must use ephemeral ports)"
 
           # Check NtpFix event log entries to confirm DLL loaded
           Start-Sleep -Seconds 5
@@ -135,8 +202,16 @@ jobs:
       - name: Verify NtpFix integration
         shell: powershell
         run: |
-          Write-Host "=== Final verification ===" -ForegroundColor Cyan
+          Write-Host "=== Final verification (port 123 block still active) ===" -ForegroundColor Cyan
           $pass = 0; $fail = 0
+
+          # Confirm the firewall rule is still in place
+          $rule = netsh advfirewall firewall show rule name="SimulateISP-BlockNTP123" 2>&1
+          if ($rule -match "SimulateISP") {
+              Write-Host "  PASS: ISP port block simulation still active" -ForegroundColor Green; $pass++
+          } else {
+              Write-Host "  FAIL: ISP port block simulation missing!" -ForegroundColor Red; $fail++
+          }
 
           # Check w32time status
           $status = w32tm /query /status 2>&1
@@ -156,7 +231,7 @@ jobs:
           if ($stratumLine -match "Stratum:\s*(\d+)") {
               $stratum = [int]$Matches[1]
               if ($stratum -ge 2 -and $stratum -le 5) {
-                  Write-Host "  PASS: Stratum=$stratum (synced)" -ForegroundColor Green; $pass++
+                  Write-Host "  PASS: Stratum=$stratum (synced despite port 123 block)" -ForegroundColor Green; $pass++
               } else {
                   Write-Host "  FAIL: Stratum=$stratum (unexpected)" -ForegroundColor Red; $fail++
               }
@@ -204,6 +279,9 @@ jobs:
           w32tm /query /configuration
           Write-Host ""
           w32tm /query /peers
+          Write-Host ""
+          Write-Host "=== Firewall rules ===" -ForegroundColor Yellow
+          netsh advfirewall firewall show rule name="SimulateISP-BlockNTP123"
           Write-Host ""
           Write-Host "=== Time Service events ===" -ForegroundColor Yellow
           Get-WinEvent -LogName System -FilterXPath "*[System[Provider[@Name='Microsoft-Windows-Time-Service']]]" -MaxEvents 20 -ErrorAction SilentlyContinue | Format-List TimeCreated, Message
