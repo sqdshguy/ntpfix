@@ -19,6 +19,7 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <wincrypt.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -195,6 +196,13 @@ static void dbg_log(const WCHAR *msg) {
 
 #define NTPFIX_POLL_SEC     64   /* poll every 64 seconds */
 #define NTPFIX_TIMEOUT_MS   5000
+#define MAXDISP_100NS       160000000LL  /* 16 seconds in 100ns ticks (RFC 5905 MAXDISP) */
+
+/*
+ * System clock precision: ~100ns (FILETIME resolution) = 10^-7 s = 2^-23.
+ * Used as floor for delay clamping per RFC 5905 Section 8.
+ */
+#define SYS_PRECISION_100NS 1  /* 100ns, our minimum measurable unit */
 
 /* ================================================================
  * NTP query - the whole point of this DLL
@@ -210,9 +218,11 @@ static BOOL ntp_query(__int64 *out_offset, __int64 *out_delay,
     struct sockaddr_in server;
     NtpPacket req, resp;
     FILETIME ft1, ft4;
-    __int64 t1, t2, t3, t4;
+    __int64 t1, t2, t3, t4, delay, rtt;
+    __int64 server_precision_100ns;
     int len;
     DWORD timeout = NTPFIX_TIMEOUT_MS;
+    HCRYPTPROV hProv = 0;
 
     /* Create UDP socket - NO bind to port 123! OS picks ephemeral port */
     sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -230,6 +240,16 @@ static BOOL ntp_query(__int64 *out_offset, __int64 *out_delay,
     /* Build NTP client request: LI=0, VN=4, Mode=3 (client) */
     memset(&req, 0, sizeof(req));
     req.li_vn_mode = 0x23;
+
+    /* Set random transmit timestamp as nonce for origin timestamp matching
+       (anti-spoofing, per RFC 5905 Section 8 and draft-ietf-ntp-data-minimization).
+       chrony, systemd-timesyncd, and beevik/ntp all do this. */
+    if (CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_FULL,
+                              CRYPT_VERIFYCONTEXT)) {
+        CryptGenRandom(hProv, 4, (BYTE *)&req.tx_ts_sec);
+        CryptGenRandom(hProv, 4, (BYTE *)&req.tx_ts_frac);
+        CryptReleaseContext(hProv, 0);
+    }
 
     /* Record T1 and send */
     GetSystemTimeAsFileTime(&ft1);
@@ -249,20 +269,69 @@ static BOOL ntp_query(__int64 *out_offset, __int64 *out_delay,
     /* Verify it's a server response (mode 4) */
     if ((resp.li_vn_mode & 0x07) != 4) return FALSE;
 
-    /* Verify stratum is valid */
+    /* Reject unsynchronized servers (leap indicator 3 = NOSYNC).
+       RFC 5905 Section 8 test 6: chrony, systemd-timesyncd, beevik/ntp all check this. */
+    if (((resp.li_vn_mode >> 6) & 0x03) == 3) return FALSE;
+
+    /* Verify stratum is valid (0 = KoD, >15 = reserved/unsync) */
     if (resp.stratum == 0 || resp.stratum > 15) return FALSE;
+
+    /* Verify origin timestamp matches our nonce (anti-spoofing).
+       Server must echo our transmit timestamp as its origin timestamp.
+       RFC 5905 test 2 (bogus packet check). */
+    if (resp.orig_ts_sec != req.tx_ts_sec ||
+        resp.orig_ts_frac != req.tx_ts_frac) return FALSE;
+
+    /* Verify server's transmit timestamp is non-zero (RFC 5905: zero = unknown time) */
+    if (resp.tx_ts_sec == 0 && resp.tx_ts_frac == 0) return FALSE;
+
+    /* Root distance sanity check: rootDelay/2 + rootDispersion < MAXDISP (16s).
+       RFC 5905 test 7. chrony, systemd-timesyncd, beevik/ntp all check this. */
+    {
+        __int64 root_dist = ntp_short_to_100ns(resp.root_delay) / 2 +
+                            ntp_short_to_100ns(resp.root_dispersion);
+        if (root_dist >= MAXDISP_100NS) return FALSE;
+    }
 
     /* Convert timestamps to 100ns (NTP epoch) */
     t1 = ft_to_ntp100ns(ft1);
     t2 = ntp_to_100ns(resp.recv_ts_sec, resp.recv_ts_frac);
     t3 = ntp_to_100ns(resp.tx_ts_sec, resp.tx_ts_frac);
     t4 = ft_to_ntp100ns(ft4);
+    rtt = t4 - t1;
 
-    /* NTP offset and delay formulas */
-    *out_offset     = ((t2 - t1) + (t3 - t4)) / 2;
-    *out_delay      = (t4 - t1) - (t3 - t2);
-    *out_dispersion = ntp_short_to_100ns(resp.root_dispersion) +
-                      (t4 - t1) / 2; /* add half RTT as dispersion */
+    /* NTP offset: ((T2-T1) + (T3-T4)) / 2 */
+    *out_offset = ((t2 - t1) + (t3 - t4)) / 2;
+
+    /* NTP delay: (T4-T1) - (T3-T2), clamped to system precision.
+       RFC 5905 Section 8: "the value of delta should be clamped not less than s.rho" */
+    delay = rtt - (t3 - t2);
+    if (delay < SYS_PRECISION_100NS) delay = SYS_PRECISION_100NS;
+    *out_delay = delay;
+
+    /* Peer dispersion per RFC 5905: epsilon = r.rho + s.rho + PHI * (T4-T1)
+       r.rho = server precision (2^precision field, converted to 100ns)
+       s.rho = our precision (SYS_PRECISION_100NS)
+       PHI * (T4-T1) = clock drift during round trip */
+    {
+        /* Convert server precision field (log2 seconds) to 100ns ticks.
+           Typical values: -20 (~1us = 10 ticks), -24 (~60ns = 1 tick). */
+        signed char sprec = (signed char)resp.precision;
+        if (sprec >= 0) {
+            server_precision_100ns = (sprec < 7)
+                ? ((__int64)1 << sprec) * 10000000LL
+                : MAXDISP_100NS; /* clamp absurd values */
+        } else {
+            int neg = -sprec;
+            server_precision_100ns = (neg < 24)
+                ? 10000000LL >> neg
+                : 1; /* sub-tick: floor at 1 */
+        }
+        if (server_precision_100ns < 1) server_precision_100ns = 1;
+    }
+    *out_dispersion = server_precision_100ns + SYS_PRECISION_100NS +
+                      (rtt * PHI_100NS_PER_SEC) / 10000000LL;
+
     *out_stratum    = resp.stratum;
     *out_refid      = resp.ref_id; /* already in network byte order = NTP format */
     *out_leap       = (resp.li_vn_mode >> 6) & 0x03;
