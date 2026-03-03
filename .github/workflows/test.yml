@@ -57,7 +57,7 @@ jobs:
           Write-Host "  Blocking outbound UDP from source port 123" -ForegroundColor Yellow
           Write-Host "  (Reproduces Vinteleport AS24945 behavior)"
 
-          # Block outbound UDP from local port 123 — this is what the ISP does:
+          # Block outbound UDP from local port 123 - this is what the ISP does:
           # drops packets where src_port=123, which kills w32time's built-in NtpClient
           netsh advfirewall firewall add rule name="SimulateISP-BlockNTP123" `
             dir=out protocol=udp localport=123 action=block | Out-Host
@@ -84,7 +84,7 @@ jobs:
               }
               $udp.Close()
           } catch {
-              # Can't bind to 123 (w32time holds it) — also proves the point
+              # Can't bind to 123 (w32time holds it) - also proves the point
               $blocked = $true
               Write-Host "    (Port 123 in use by w32time, also proves the block)" -ForegroundColor DarkGray
           }
@@ -164,7 +164,7 @@ jobs:
         shell: powershell
         run: |
           Write-Host "=== Waiting for NtpFix to produce samples ===" -ForegroundColor Cyan
-          Write-Host "  (Port 123 block is still active — NtpFix must use ephemeral ports)"
+          Write-Host "  (Port 123 block is still active - NtpFix must use ephemeral ports)"
 
           # Check NtpFix event log entries to confirm DLL loaded
           Start-Sleep -Seconds 5
