@@ -53,14 +53,16 @@ jobs:
       - name: Check w32time baseline
         shell: powershell
         run: |
+          $ErrorActionPreference = "Continue"
           Write-Host "=== w32time status before NtpFix ===" -ForegroundColor Cyan
-          net start w32time 2>$null
+          net start w32time 2>&1 | Out-Host
           w32tm /query /status
-          w32tm /query /configuration | Select-String "NtpClient|NtpServer|Enabled|Type|NtpServer"
+          w32tm /query /configuration | Select-String "NtpClient|NtpServer|Enabled|Type|NtpServer|VMICTime"
 
       - name: Install NtpFix
         shell: powershell
         run: |
+          $ErrorActionPreference = "Continue"
           Write-Host "=== Installing NtpFix ===" -ForegroundColor Cyan
 
           # Copy DLL to System32
@@ -80,9 +82,16 @@ jobs:
           Set-ItemProperty -Path $ntpClientKey -Name "Enabled" -Value 0 -Type DWord
           Write-Host "  Disabled built-in NtpClient"
 
+          # Also disable VMICTimeProvider (GitHub runners are Hyper-V VMs)
+          $vmicKey = "HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\VMICTimeProvider"
+          if (Test-Path $vmicKey) {
+              Set-ItemProperty -Path $vmicKey -Name "Enabled" -Value 0 -Type DWord
+              Write-Host "  Disabled VMICTimeProvider (Hyper-V VM)"
+          }
+
           # Restart w32time
-          net stop w32time 2>$null
-          net start w32time
+          net stop w32time 2>&1 | Out-Host
+          net start w32time 2>&1 | Out-Host
           Write-Host "  Restarted w32time"
 
       - name: Wait for NtpFix to sync
