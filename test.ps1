@@ -26,7 +26,7 @@ Write-Host "=== NtpFix Test Suite ===" -ForegroundColor Cyan
 Write-Host ""
 
 # -------------------------------------------------------
-Write-Host "[1/5] Network: NTP from ephemeral port" -ForegroundColor Yellow
+Write-Host "[1/6] Network: NTP from ephemeral port" -ForegroundColor Yellow
 # -------------------------------------------------------
 $ntpOk = $false
 $offset = $null
@@ -55,7 +55,7 @@ Test "Used ephemeral source port ($srcPort)" ($srcPort -gt 1024)
 
 # -------------------------------------------------------
 Write-Host ""
-Write-Host "[2/5] Network: Port 123 is blocked (confirming the ISP bug)" -ForegroundColor Yellow
+Write-Host "[2/6] Network: Port 123 is blocked (confirming the ISP bug)" -ForegroundColor Yellow
 # -------------------------------------------------------
 $port123Blocked = $false
 try {
@@ -92,7 +92,7 @@ if ($port123Blocked -eq $null) {
 
 # -------------------------------------------------------
 Write-Host ""
-Write-Host "[3/5] NTP offset calculation" -ForegroundColor Yellow
+Write-Host "[3/6] NTP offset calculation" -ForegroundColor Yellow
 # -------------------------------------------------------
 $stripOutput = w32tm /stripchart /computer:time.google.com /dataonly /samples:1 2>&1
 $stripLine = ($stripOutput | Select-Object -Last 1) -as [string]
@@ -108,7 +108,7 @@ if ($offsetMatch.Success) {
 
 # -------------------------------------------------------
 Write-Host ""
-Write-Host "[4/5] DLL build check" -ForegroundColor Yellow
+Write-Host "[4/6] DLL build check" -ForegroundColor Yellow
 # -------------------------------------------------------
 $dllExists = Test-Path "ntpfix.dll"
 Test "ntpfix.dll exists" $dllExists "Run build.bat first"
@@ -147,7 +147,7 @@ if ($dllExists) {
 
 # -------------------------------------------------------
 Write-Host ""
-Write-Host "[5/5] Registration check" -ForegroundColor Yellow
+Write-Host "[5/6] Registration check" -ForegroundColor Yellow
 # -------------------------------------------------------
 $regKey = "HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpFix"
 $isRegistered = Test-Path $regKey
@@ -176,6 +176,19 @@ if ($isRegistered) {
 } else {
     Write-Host "  SKIP  " -ForegroundColor DarkGray -NoNewline
     Write-Host "NtpFix not installed yet (run install.ps1)"
+}
+
+# -------------------------------------------------------
+Write-Host ""
+Write-Host "[6/6] Service startup check" -ForegroundColor Yellow
+# -------------------------------------------------------
+$svc = Get-Service w32time -ErrorAction SilentlyContinue
+if ($svc) {
+    Test "w32time is running" ($svc.Status -eq "Running") "Status: $($svc.Status)"
+    $isAuto = $svc.StartType -eq "Automatic"
+    Test "w32time starts automatically on boot" $isAuto "StartType: $($svc.StartType). Fix: Set-Service w32time -StartupType Automatic"
+} else {
+    Test "w32time service exists" $false "Service not found"
 }
 
 # -------------------------------------------------------

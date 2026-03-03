@@ -1,0 +1,5 @@
+ntpfix.dll
+ntpfix.zip
+*.obj
+*.lib
+*.exp

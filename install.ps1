@@ -57,6 +57,10 @@ Set-ItemProperty -Path $ntpFixKey -Name "InputProvider"  -Value 1        -Type D
 Write-Host "Disabling built-in NTP client (port 123 is blocked by ISP)..." -ForegroundColor Yellow
 Set-ItemProperty -Path "$providerKey\NtpClient" -Name "Enabled" -Value 0 -Type DWord
 
+# Ensure w32time starts automatically on boot
+Write-Host "Setting w32time to start automatically..." -ForegroundColor Cyan
+Set-Service w32time -StartupType Automatic
+
 # Restart w32time
 Write-Host "Restarting Windows Time service..." -ForegroundColor Cyan
 net stop w32time 2>$null

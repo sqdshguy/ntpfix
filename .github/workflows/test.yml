@@ -3,6 +3,7 @@ name: Test NtpFix on Windows
 on:
   push:
     branches: [master, main]
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -125,40 +126,28 @@ jobs:
           w32tm /query /status
           w32tm /query /configuration | Select-String "NtpClient|NtpServer|Enabled|Type|NtpServer|VMICTime"
 
-      - name: Install NtpFix
+      - name: Run install.ps1
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
-          Write-Host "=== Installing NtpFix ===" -ForegroundColor Cyan
+          Write-Host "=== Running install.ps1 ===" -ForegroundColor Cyan
 
-          # Copy DLL to System32
-          Copy-Item ntpfix.dll C:\Windows\System32\ntpfix.dll -Force
-          Write-Host "  Copied DLL to System32"
+          # install.ps1 requires admin (which GH runners have) and stops/starts w32time
+          # It also tries to build if no DLL exists, but we already built it
+          .\install.ps1
 
-          # Register time provider
-          $key = "HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpFix"
-          New-Item -Path $key -Force | Out-Null
-          Set-ItemProperty -Path $key -Name "DllName"      -Value "C:\Windows\System32\ntpfix.dll" -Type String
-          Set-ItemProperty -Path $key -Name "Enabled"      -Value 1 -Type DWord
-          Set-ItemProperty -Path $key -Name "InputProvider" -Value 1 -Type DWord
-          Write-Host "  Registered NtpFix provider"
-
-          # Disable built-in NTP client
-          $ntpClientKey = "HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpClient"
-          Set-ItemProperty -Path $ntpClientKey -Name "Enabled" -Value 0 -Type DWord
-          Write-Host "  Disabled built-in NtpClient"
-
-          # Also disable VMICTimeProvider (GitHub runners are Hyper-V VMs)
+      - name: Disable VMICTimeProvider
+        shell: powershell
+        run: |
+          # GitHub runners are Hyper-V VMs - disable VMIC so NtpFix is the only provider
+          $ErrorActionPreference = "Continue"
           $vmicKey = "HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\VMICTimeProvider"
           if (Test-Path $vmicKey) {
               Set-ItemProperty -Path $vmicKey -Name "Enabled" -Value 0 -Type DWord
-              Write-Host "  Disabled VMICTimeProvider (Hyper-V VM)"
+              Write-Host "Disabled VMICTimeProvider (Hyper-V VM)"
+              net stop w32time 2>&1 | Out-Host
+              net start w32time 2>&1 | Out-Host
           }
-
-          # Restart w32time
-          net stop w32time 2>&1 | Out-Host
-          net start w32time 2>&1 | Out-Host
-          Write-Host "  Restarted w32time"
 
       - name: Wait for NtpFix to sync
         shell: powershell
@@ -198,6 +187,19 @@ jobs:
           if (-not $synced) {
               Write-Host "  WARNING: Source not yet NtpFix after $maxAttempts attempts" -ForegroundColor Yellow
           }
+
+      - name: Run test.ps1
+        shell: powershell
+        run: |
+          Write-Host "=== Running test.ps1 ===" -ForegroundColor Cyan
+          .\test.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Run diag.ps1
+        shell: powershell
+        run: |
+          Write-Host "=== Running diag.ps1 ===" -ForegroundColor Cyan
+          .\diag.ps1
 
       - name: Verify NtpFix integration
         shell: powershell
@@ -262,6 +264,56 @@ jobs:
               Write-Host "  PASS: Built-in NtpClient disabled" -ForegroundColor Green; $pass++
           } else {
               Write-Host "  FAIL: Built-in NtpClient still enabled" -ForegroundColor Red; $fail++
+          }
+
+          # Check w32time startup type
+          $svc = Get-Service w32time
+          if ($svc.StartType -eq "Automatic") {
+              Write-Host "  PASS: w32time set to auto-start" -ForegroundColor Green; $pass++
+          } else {
+              Write-Host "  FAIL: w32time startup is $($svc.StartType), should be Automatic" -ForegroundColor Red; $fail++
+          }
+
+          Write-Host ""
+          Write-Host "Results: $pass passed, $fail failed" -ForegroundColor $(if ($fail -eq 0) { "Green" } else { "Red" })
+          if ($fail -gt 0) { exit 1 }
+
+      - name: Run uninstall.ps1
+        shell: powershell
+        run: |
+          Write-Host "=== Running uninstall.ps1 ===" -ForegroundColor Cyan
+          $ErrorActionPreference = "Continue"
+          .\uninstall.ps1
+
+      - name: Verify uninstall
+        shell: powershell
+        run: |
+          Write-Host "=== Verifying uninstall ===" -ForegroundColor Cyan
+          $pass = 0; $fail = 0
+
+          # NtpFix provider should be gone
+          $key = "HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpFix"
+          if (-not (Test-Path $key)) {
+              Write-Host "  PASS: NtpFix provider removed" -ForegroundColor Green; $pass++
+          } else {
+              Write-Host "  FAIL: NtpFix provider still registered" -ForegroundColor Red; $fail++
+          }
+
+          # NtpClient should be re-enabled
+          $ntpKey = "HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpClient"
+          $ntpEnabled = (Get-ItemProperty $ntpKey -ErrorAction SilentlyContinue).Enabled
+          if ($ntpEnabled -eq 1) {
+              Write-Host "  PASS: Built-in NtpClient re-enabled" -ForegroundColor Green; $pass++
+          } else {
+              Write-Host "  FAIL: NtpClient still disabled (Enabled=$ntpEnabled)" -ForegroundColor Red; $fail++
+          }
+
+          # w32time should still be running
+          $svc = Get-Service w32time -ErrorAction SilentlyContinue
+          if ($svc.Status -eq "Running") {
+              Write-Host "  PASS: w32time still running" -ForegroundColor Green; $pass++
+          } else {
+              Write-Host "  FAIL: w32time not running ($($svc.Status))" -ForegroundColor Red; $fail++
           }
 
           Write-Host ""
