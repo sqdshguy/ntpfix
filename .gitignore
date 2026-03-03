@@ -3,3 +3,4 @@ ntpfix.zip
 *.obj
 *.lib
 *.exp
+test_ntp
