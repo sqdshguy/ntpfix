@@ -171,8 +171,17 @@ static HANDLE               g_hStopEvent = NULL;
 static CRITICAL_SECTION     g_cs;
 static BOOL                 g_hasSample  = FALSE;
 static TimeSample           g_sample;
+static unsigned __int64     g_baseDispersion = 0; /* dispersion at measurement time */
+static unsigned __int64     g_sampleTickCount = 0; /* tick count when sample was taken */
 static WCHAR                g_wzDllPath[MAX_PATH];
 static int                  g_serverIdx  = 0;
+
+/*
+ * RFC 5905 PHI (max clock skew rate): 15ppm = 15e-6 s/s = 150 100ns-ticks/s.
+ * Used to accumulate dispersion over time since sample was taken,
+ * matching the pattern in NT5 ntpprov.cpp and hwprov.cpp.
+ */
+#define PHI_100NS_PER_SEC 150
 
 /* Debug logging to Windows Event Log */
 static void dbg_log(const WCHAR *msg) {
@@ -291,11 +300,21 @@ static DWORD WINAPI PollThread(LPVOID param) {
             g_sample.dwRefid      = refid;
             g_sample.toOffset     = offset;
             g_sample.toDelay      = delay;
-            g_sample.tpDispersion = (unsigned __int64)(dispersion > 0 ? dispersion : 1);
             g_sample.nStratum     = stratum;
             g_sample.nLeapFlags   = leap;
             g_sample.dwTSFlags    = 0;
             wcscpy(g_sample.wszUniqueName, L"NtpFix:time.google.com");
+
+            /* Store base dispersion; skew accumulation added at GetSamples time */
+            g_baseDispersion = (unsigned __int64)(dispersion > 0 ? dispersion : 1);
+            g_sample.tpDispersion = g_baseDispersion;
+
+            /* Capture tick count and phase offset at measurement time,
+               matching NT5 ntpprov.cpp and XenTimeProvider behavior */
+            g_sc.pfnGetTimeSysInfo(TSI_TickCount,   &g_sample.nSysTickCount);
+            g_sc.pfnGetTimeSysInfo(TSI_PhaseOffset,  &g_sample.nSysPhaseOffset);
+            g_sampleTickCount = g_sample.nSysTickCount;
+
             g_hasSample = TRUE;
 
             LeaveCriticalSection(&g_cs);
@@ -355,10 +374,20 @@ HRESULT __stdcall TimeProvCommand(TimeProvHandle hTimeProv, TimeProvCmd eCmd,
             EnterCriticalSection(&g_cs);
             if (g_hasSample && pArgs->pbSampleBuf &&
                 pArgs->cbSampleBuf >= sizeof(TimeSample)) {
-                /* Refresh tick count and phase offset to NOW so w32time
-                   doesn't reject the sample as stale */
-                g_sc.pfnGetTimeSysInfo(TSI_TickCount,    &g_sample.nSysTickCount);
-                g_sc.pfnGetTimeSysInfo(TSI_PhaseOffset,  &g_sample.nSysPhaseOffset);
+                /*
+                 * Accumulate dispersion based on time elapsed since
+                 * the sample was taken, per RFC 5905 / NT5 hwprov.cpp:
+                 *   dispersion += elapsed * PHI
+                 * where PHI = 15ppm (max assumed clock skew rate).
+                 */
+                unsigned __int64 nowTick = 0;
+                g_sc.pfnGetTimeSysInfo(TSI_TickCount, &nowTick);
+                if (nowTick > g_sampleTickCount) {
+                    unsigned __int64 elapsed = nowTick - g_sampleTickCount;
+                    /* elapsed is in 100ns ticks; PHI = 150 per 10^7 ticks (1 second) */
+                    unsigned __int64 skew = (elapsed * PHI_100NS_PER_SEC) / 10000000ULL;
+                    g_sample.tpDispersion = g_baseDispersion + skew;
+                }
 
                 /* Copy sample into w32time's pre-allocated buffer */
                 CopyMemory(pArgs->pbSampleBuf, &g_sample, sizeof(TimeSample));
