@@ -201,6 +201,19 @@ jobs:
           Write-Host "=== Running diag.ps1 ===" -ForegroundColor Cyan
           .\diag.ps1
 
+      - name: Wait for re-sync after test.ps1
+        shell: powershell
+        run: |
+          # test.ps1 restarts w32time during the port 123 test, which resets sync state.
+          # Wait for NtpFix to re-sync before final verification.
+          Write-Host "Waiting for NtpFix to re-sync after test.ps1 restart..." -ForegroundColor Cyan
+          for ($i = 1; $i -le 12; $i++) {
+              Start-Sleep -Seconds 10
+              $source = (w32tm /query /status 2>&1 | Select-String "Source:") -as [string]
+              Write-Host "  Attempt $i/12 - $source"
+              if ($source -match "NtpFix") { break }
+          }
+
       - name: Verify NtpFix integration
         shell: powershell
         run: |
