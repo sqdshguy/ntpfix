@@ -1,0 +1,190 @@
+name: Test NtpFix on Windows
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with MSVC
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cl /LD /O2 /W4 ntpfix.c ws2_32.lib advapi32.lib user32.lib /Fe:ntpfix.dll
+          if not exist ntpfix.dll exit /b 1
+          echo Build successful
+
+      - name: Verify DLL exports
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          dumpbin /exports ntpfix.dll
+          dumpbin /exports ntpfix.dll | findstr "TimeProvOpen TimeProvCommand TimeProvClose Register Deregister"
+          if %errorlevel% neq 0 exit /b 1
+          echo All exports present
+
+      - name: Pre-install NTP tests
+        shell: powershell
+        run: |
+          Write-Host "=== Test: NTP from ephemeral port ===" -ForegroundColor Cyan
+          $udp = New-Object System.Net.Sockets.UdpClient
+          $udp.Client.ReceiveTimeout = 5000
+          $packet = [byte[]]::new(48)
+          $packet[0] = 0x23
+          $udp.Send($packet, 48, "216.239.35.8", 123) | Out-Null
+          $ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+          $resp = $udp.Receive([ref]$ep)
+          $port = $udp.Client.LocalEndPoint.Port
+          $udp.Close()
+          if ($resp.Length -ne 48) { Write-Error "Bad response"; exit 1 }
+          $mode = $resp[0] -band 0x07
+          $stratum = $resp[1]
+          Write-Host "  Response: $($resp.Length) bytes, mode=$mode, stratum=$stratum, src_port=$port"
+          if ($mode -ne 4) { Write-Error "Not server mode"; exit 1 }
+          if ($stratum -lt 1 -or $stratum -gt 15) { Write-Error "Bad stratum"; exit 1 }
+          if ($port -le 1024) { Write-Error "Used low port"; exit 1 }
+          Write-Host "  PASS: NTP works from ephemeral port" -ForegroundColor Green
+
+      - name: Check w32time baseline
+        shell: powershell
+        run: |
+          Write-Host "=== w32time status before NtpFix ===" -ForegroundColor Cyan
+          net start w32time 2>$null
+          w32tm /query /status
+          w32tm /query /configuration | Select-String "NtpClient|NtpServer|Enabled|Type|NtpServer"
+
+      - name: Install NtpFix
+        shell: powershell
+        run: |
+          Write-Host "=== Installing NtpFix ===" -ForegroundColor Cyan
+
+          # Copy DLL to System32
+          Copy-Item ntpfix.dll C:\Windows\System32\ntpfix.dll -Force
+          Write-Host "  Copied DLL to System32"
+
+          # Register time provider
+          $key = "HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpFix"
+          New-Item -Path $key -Force | Out-Null
+          Set-ItemProperty -Path $key -Name "DllName"      -Value "C:\Windows\System32\ntpfix.dll" -Type String
+          Set-ItemProperty -Path $key -Name "Enabled"      -Value 1 -Type DWord
+          Set-ItemProperty -Path $key -Name "InputProvider" -Value 1 -Type DWord
+          Write-Host "  Registered NtpFix provider"
+
+          # Disable built-in NTP client
+          $ntpClientKey = "HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpClient"
+          Set-ItemProperty -Path $ntpClientKey -Name "Enabled" -Value 0 -Type DWord
+          Write-Host "  Disabled built-in NtpClient"
+
+          # Restart w32time
+          net stop w32time 2>$null
+          net start w32time
+          Write-Host "  Restarted w32time"
+
+      - name: Wait for NtpFix to sync
+        shell: powershell
+        run: |
+          Write-Host "=== Waiting for NtpFix to produce samples ===" -ForegroundColor Cyan
+          # Poll every 10 seconds for up to 2 minutes
+          $maxAttempts = 12
+          $synced = $false
+          for ($i = 1; $i -le $maxAttempts; $i++) {
+              Start-Sleep -Seconds 10
+              $status = w32tm /query /status 2>&1
+              $source = ($status | Select-String "Source:") -as [string]
+              Write-Host "  Attempt $i/$maxAttempts - $source"
+              if ($source -match "NtpFix") {
+                  $synced = $true
+                  break
+              }
+          }
+          if (-not $synced) {
+              Write-Host "  WARNING: Source not yet NtpFix, checking debug log..." -ForegroundColor Yellow
+          }
+
+      - name: Verify NtpFix integration
+        shell: powershell
+        run: |
+          Write-Host "=== Final verification ===" -ForegroundColor Cyan
+          $pass = 0; $fail = 0
+
+          # Check w32time status
+          $status = w32tm /query /status 2>&1
+          Write-Host ($status | Out-String)
+
+          # Check source
+          $source = ($status | Select-String "Source:") -as [string]
+          $isNtpFix = $source -match "NtpFix"
+          if ($isNtpFix) {
+              Write-Host "  PASS: Source is NtpFix" -ForegroundColor Green; $pass++
+          } else {
+              Write-Host "  FAIL: Source is not NtpFix ($source)" -ForegroundColor Red; $fail++
+          }
+
+          # Check stratum (should be 2 = synced to stratum 1 NTP server)
+          $stratumLine = ($status | Select-String "Stratum:") -as [string]
+          if ($stratumLine -match "Stratum:\s*(\d+)") {
+              $stratum = [int]$Matches[1]
+              if ($stratum -ge 2 -and $stratum -le 5) {
+                  Write-Host "  PASS: Stratum=$stratum (synced)" -ForegroundColor Green; $pass++
+              } else {
+                  Write-Host "  FAIL: Stratum=$stratum (unexpected)" -ForegroundColor Red; $fail++
+              }
+          }
+
+          # Check it's not LOCL anymore
+          $refId = ($status | Select-String "ReferenceId:") -as [string]
+          $isLocal = $refId -match "LOCL"
+          if (-not $isLocal) {
+              Write-Host "  PASS: Not using Local CMOS Clock" -ForegroundColor Green; $pass++
+          } else {
+              Write-Host "  FAIL: Still using LOCL" -ForegroundColor Red; $fail++
+          }
+
+          # Check NtpFix is registered
+          $key = "HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpFix"
+          $enabled = (Get-ItemProperty $key -ErrorAction SilentlyContinue).Enabled
+          if ($enabled -eq 1) {
+              Write-Host "  PASS: NtpFix registered and enabled" -ForegroundColor Green; $pass++
+          } else {
+              Write-Host "  FAIL: NtpFix not registered" -ForegroundColor Red; $fail++
+          }
+
+          # Check built-in NtpClient is disabled
+          $ntpKey = "HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpClient"
+          $ntpEnabled = (Get-ItemProperty $ntpKey -ErrorAction SilentlyContinue).Enabled
+          if ($ntpEnabled -eq 0) {
+              Write-Host "  PASS: Built-in NtpClient disabled" -ForegroundColor Green; $pass++
+          } else {
+              Write-Host "  FAIL: Built-in NtpClient still enabled" -ForegroundColor Red; $fail++
+          }
+
+          Write-Host ""
+          Write-Host "Results: $pass passed, $fail failed" -ForegroundColor $(if ($fail -eq 0) { "Green" } else { "Red" })
+          if ($fail -gt 0) { exit 1 }
+
+      - name: Collect debug logs on failure
+        if: failure()
+        shell: powershell
+        run: |
+          Write-Host "=== Debug info ===" -ForegroundColor Yellow
+          w32tm /query /status /verbose
+          Write-Host ""
+          w32tm /query /configuration
+          Write-Host ""
+          w32tm /query /peers
+          Write-Host ""
+          Get-WinEvent -LogName System -FilterXPath "*[System[Provider[@Name='Microsoft-Windows-Time-Service']]]" -MaxEvents 20 | Format-List TimeCreated, Message
+          Write-Host ""
+          Get-WinEvent -LogName "Microsoft-Windows-Time-Service/Operational" -MaxEvents 20 -ErrorAction SilentlyContinue | Format-List TimeCreated, Message
+
+      - name: Upload DLL artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ntpfix-dll
+          path: ntpfix.dll
