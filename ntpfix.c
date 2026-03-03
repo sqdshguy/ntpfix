@@ -178,6 +178,20 @@ static WCHAR                g_wzDllPath[MAX_PATH];
 static int                  g_serverIdx  = 0;
 
 /*
+ * Per-server KoD state (RFC 5905 Section 7.4).
+ * skip_polls: remaining poll cycles to skip this server.
+ *   DENY/RSTR: set to KOD_DENY_SKIP (permanent-ish blacklist).
+ *   RATE:      doubles each time, capped at KOD_RATE_MAX_SKIP.
+ */
+static int                  g_serverSkip[4]; /* NUM_SERVERS */
+#define KOD_DENY            0x44454E59  /* "DENY" */
+#define KOD_RSTR            0x52535452  /* "RSTR" */
+#define KOD_RATE            0x52415445  /* "RATE" */
+#define KOD_DENY_SKIP       86400       /* ~64 days at 64s poll */
+#define KOD_RATE_INIT_SKIP  4           /* initial RATE backoff */
+#define KOD_RATE_MAX_SKIP   256         /* max RATE backoff (~4.5hr) */
+
+/*
  * RFC 5905 PHI (max clock skew rate): 15ppm = 15e-6 s/s = 150 100ns-ticks/s.
  * Used to accumulate dispersion over time since sample was taken,
  * matching the pattern in NT5 ntpprov.cpp and hwprov.cpp.
@@ -211,7 +225,8 @@ static void dbg_log(const WCHAR *msg) {
  * Returns the clock offset in 100ns units, or 0 on failure.
  * ================================================================ */
 
-static BOOL ntp_query(__int64 *out_offset, __int64 *out_delay,
+static BOOL ntp_query(const char *server_ip, int server_idx,
+                      __int64 *out_offset, __int64 *out_delay,
                       __int64 *out_dispersion, BYTE *out_stratum,
                       DWORD *out_refid, BYTE *out_leap) {
     SOCKET sock;
@@ -230,12 +245,10 @@ static BOOL ntp_query(__int64 *out_offset, __int64 *out_delay,
 
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
 
-    /* Pick next server (round-robin) */
     memset(&server, 0, sizeof(server));
     server.sin_family = AF_INET;
     server.sin_port   = htons(123);
-    inet_pton(AF_INET, g_servers[g_serverIdx % NUM_SERVERS], &server.sin_addr);
-    g_serverIdx++;
+    inet_pton(AF_INET, server_ip, &server.sin_addr);
 
     /* Build NTP client request: LI=0, VN=4, Mode=3 (client) */
     memset(&req, 0, sizeof(req));
@@ -243,13 +256,21 @@ static BOOL ntp_query(__int64 *out_offset, __int64 *out_delay,
 
     /* Set random transmit timestamp as nonce for origin timestamp matching
        (anti-spoofing, per RFC 5905 Section 8 and draft-ietf-ntp-data-minimization).
-       chrony, systemd-timesyncd, and beevik/ntp all do this. */
-    if (CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_FULL,
-                              CRYPT_VERIFYCONTEXT)) {
-        CryptGenRandom(hProv, 4, (BYTE *)&req.tx_ts_sec);
-        CryptGenRandom(hProv, 4, (BYTE *)&req.tx_ts_frac);
-        CryptReleaseContext(hProv, 0);
+       chrony, systemd-timesyncd, and beevik/ntp all do this.
+       Abort if RNG fails - never send with a predictable nonce. */
+    if (!CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_FULL,
+                               CRYPT_VERIFYCONTEXT)) {
+        closesocket(sock);
+        dbg_log(L"CryptAcquireContext failed - aborting query");
+        return FALSE;
     }
+    CryptGenRandom(hProv, 4, (BYTE *)&req.tx_ts_sec);
+    CryptGenRandom(hProv, 4, (BYTE *)&req.tx_ts_frac);
+    CryptReleaseContext(hProv, 0);
+
+    /* Ensure nonce is not accidentally zero (would weaken anti-spoofing) */
+    if (req.tx_ts_sec == 0 && req.tx_ts_frac == 0)
+        req.tx_ts_frac = 1;
 
     /* Record T1 and send */
     GetSystemTimeAsFileTime(&ft1);
@@ -269,24 +290,50 @@ static BOOL ntp_query(__int64 *out_offset, __int64 *out_delay,
     /* Verify it's a server response (mode 4) */
     if ((resp.li_vn_mode & 0x07) != 4) return FALSE;
 
-    /* Reject unsynchronized servers (leap indicator 3 = NOSYNC).
-       RFC 5905 Section 8 test 6: chrony, systemd-timesyncd, beevik/ntp all check this. */
-    if (((resp.li_vn_mode >> 6) & 0x03) == 3) return FALSE;
-
-    /* Verify stratum is valid (0 = KoD, >15 = reserved/unsync) */
-    if (resp.stratum == 0 || resp.stratum > 15) return FALSE;
-
-    /* Verify origin timestamp matches our nonce (anti-spoofing).
-       Server must echo our transmit timestamp as its origin timestamp.
-       RFC 5905 test 2 (bogus packet check). */
+    /* Verify origin timestamp matches our nonce FIRST (anti-spoofing).
+       This MUST come before KoD handling so spoofed KoD packets are rejected.
+       Same order as chrony: test2 (origin match) before KoD processing.
+       Prevents CVE-2015-7704 class attacks (spoofed KoD causing sync loss). */
     if (resp.orig_ts_sec != req.tx_ts_sec ||
         resp.orig_ts_frac != req.tx_ts_frac) return FALSE;
+
+    /* KoD handling (RFC 5905 Section 7.4).
+       Stratum 0 = Kiss-of-Death. Only process after origin match verified.
+       DENY/RSTR: MUST stop sending to this server (RFC 5905 MUST).
+       RATE: MUST reduce polling frequency (RFC 5905 MUST). */
+    if (resp.stratum == 0) {
+        DWORD kod_code = ntohl(resp.ref_id);
+        WCHAR kod_msg[128];
+        if (kod_code == KOD_DENY || kod_code == KOD_RSTR) {
+            g_serverSkip[server_idx] = KOD_DENY_SKIP;
+            _snwprintf(kod_msg, 128, L"KoD %c%c%c%c from %hs: server blacklisted",
+                       (char)(kod_code >> 24), (char)(kod_code >> 16),
+                       (char)(kod_code >> 8), (char)kod_code, server_ip);
+            dbg_log(kod_msg);
+        } else if (kod_code == KOD_RATE) {
+            int cur = g_serverSkip[server_idx];
+            g_serverSkip[server_idx] = (cur < KOD_RATE_INIT_SKIP)
+                ? KOD_RATE_INIT_SKIP
+                : ((cur * 2 > KOD_RATE_MAX_SKIP) ? KOD_RATE_MAX_SKIP : cur * 2);
+            _snwprintf(kod_msg, 128, L"KoD RATE from %hs: backing off %d polls",
+                       server_ip, g_serverSkip[server_idx]);
+            dbg_log(kod_msg);
+        }
+        return FALSE;
+    }
+
+    /* Verify stratum is valid (>15 = reserved/unsync) */
+    if (resp.stratum > 15) return FALSE;
+
+    /* Reject unsynchronized servers (leap indicator 3 = NOSYNC).
+       RFC 5905 test 6. */
+    if (((resp.li_vn_mode >> 6) & 0x03) == 3) return FALSE;
 
     /* Verify server's transmit timestamp is non-zero (RFC 5905: zero = unknown time) */
     if (resp.tx_ts_sec == 0 && resp.tx_ts_frac == 0) return FALSE;
 
     /* Root distance sanity check: rootDelay/2 + rootDispersion < MAXDISP (16s).
-       RFC 5905 test 7. chrony, systemd-timesyncd, beevik/ntp all check this. */
+       RFC 5905 test 7. */
     {
         __int64 root_dist = ntp_short_to_100ns(resp.root_delay) / 2 +
                             ntp_short_to_100ns(resp.root_dispersion);
@@ -354,8 +401,28 @@ static DWORD WINAPI PollThread(LPVOID param) {
         __int64 offset, delay, dispersion;
         BYTE    stratum, leap;
         DWORD   refid;
+        int     idx, attempts;
+        const char *server_ip = NULL;
 
-        if (ntp_query(&offset, &delay, &dispersion, &stratum, &refid, &leap)) {
+        /* Pick next available server, skipping KoD-blacklisted ones.
+           Decrement skip counters as we scan. */
+        for (attempts = 0; attempts < (int)NUM_SERVERS; attempts++) {
+            idx = g_serverIdx % NUM_SERVERS;
+            g_serverIdx = (g_serverIdx + 1) % (int)(NUM_SERVERS * 1000);
+            if (g_serverSkip[idx] > 0) {
+                g_serverSkip[idx]--;
+                continue;
+            }
+            server_ip = g_servers[idx];
+            break;
+        }
+        if (!server_ip) {
+            dbg_log(L"All servers skipped (KoD backoff), waiting");
+            goto poll_wait;
+        }
+
+        if (ntp_query(server_ip, idx, &offset, &delay, &dispersion,
+                      &stratum, &refid, &leap)) {
             WCHAR msg[256];
             _snwprintf(msg, 256,
                 L"NTP OK: offset=%I64d delay=%I64d disp=%I64d stratum=%d refid=0x%08X",
@@ -395,6 +462,7 @@ static DWORD WINAPI PollThread(LPVOID param) {
             dbg_log(L"NTP query failed (timeout or bad response)");
         }
 
+    poll_wait:
         /* Wait for stop event or poll interval */
         if (WaitForSingleObject(g_hStopEvent,
                                 NTPFIX_POLL_SEC * 1000) != WAIT_TIMEOUT) {
@@ -455,7 +523,11 @@ HRESULT __stdcall TimeProvCommand(TimeProvHandle hTimeProv, TimeProvCmd eCmd,
                     unsigned __int64 elapsed = nowTick - g_sampleTickCount;
                     /* elapsed is in 100ns ticks; PHI = 150 per 10^7 ticks (1 second) */
                     unsigned __int64 skew = (elapsed * PHI_100NS_PER_SEC) / 10000000ULL;
-                    g_sample.tpDispersion = g_baseDispersion + skew;
+                    unsigned __int64 disp = g_baseDispersion + skew;
+                    /* Cap at MAXDISP (16s) - RFC 5905: samples with
+                       dispersion >= MAXDISP are considered invalid */
+                    g_sample.tpDispersion = (disp < (unsigned __int64)MAXDISP_100NS)
+                        ? disp : (unsigned __int64)MAXDISP_100NS;
                 }
 
                 /* Copy sample into w32time's pre-allocated buffer */
