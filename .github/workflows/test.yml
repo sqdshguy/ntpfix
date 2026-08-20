@@ -12,10 +12,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Locate MSVC
+        shell: cmd
+        run: |
+          set "VSWHERE=C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          if not exist "%VSWHERE%" echo vswhere.exe not found && exit /b 1
+          for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL echo No Visual Studio with the C++ toolset found && exit /b 1
+          if not exist "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat" echo vcvars64.bat missing under "%VSINSTALL%" && exit /b 1
+          echo Using Visual Studio at %VSINSTALL%
+          echo VCVARS=%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat>>"%GITHUB_ENV%"
+
       - name: Build with MSVC
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          call "%VCVARS%"
           cl /LD /O2 /W4 ntpfix.c ws2_32.lib advapi32.lib user32.lib /Fe:ntpfix.dll
           if not exist ntpfix.dll exit /b 1
           echo Build successful
@@ -23,7 +34,7 @@ jobs:
       - name: Verify DLL exports
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          call "%VCVARS%"
           dumpbin /exports ntpfix.dll
           dumpbin /exports ntpfix.dll | findstr "TimeProvOpen TimeProvCommand TimeProvClose Register Deregister"
           if %errorlevel% neq 0 exit /b 1
