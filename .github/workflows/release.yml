@@ -69,11 +69,7 @@ jobs:
           body: |
             ## Verifying this build
 
-            `ntpfix.dll` is installed into `System32` and loaded by the `w32time`
-            service, so verify it before you trust it. Both artifacts are signed
-            with GitHub build provenance. This proves the binary was produced by
-            this repo's release workflow from this exact commit, and not uploaded
-            by hand.
+            `ntpfix.dll` is installed into `System32` and loaded by the `w32time` service, so verify it before you trust it. Both artifacts are signed with GitHub build provenance. This proves the binary was produced by this repo's release workflow from this exact commit, and not uploaded by hand.
 
             ```
             gh attestation verify ntpfix.zip --repo ${{ github.repository }}
@@ -92,5 +88,4 @@ jobs:
             ${{ steps.hashes.outputs.zip }}  ntpfix.zip
             ```
 
-            Prefer to build it yourself? It is one file and one command, see
-            [Building from source](https://github.com/${{ github.repository }}#building-from-source).
+            Prefer to build it yourself? It is one file and one command, see [Building from source](https://github.com/${{ github.repository }}#building-from-source).
