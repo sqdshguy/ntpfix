@@ -5,7 +5,9 @@ on:
     tags: ['v*']
 
 permissions:
-  contents: write
+  contents: write      # create the release
+  id-token: write      # OIDC token for provenance signing
+  attestations: write  # write the attestation to the attestation store
 
 jobs:
   release:
@@ -32,8 +34,52 @@ jobs:
         run: |
           Compress-Archive -Path ntpfix.dll, install.ps1, uninstall.ps1, test.ps1, diag.ps1 -DestinationPath ntpfix.zip
 
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            ntpfix.dll
+            ntpfix.zip
+
+      - name: Compute checksums
+        id: hashes
+        shell: powershell
+        run: |
+          $dll = (Get-FileHash ntpfix.dll -Algorithm SHA256).Hash.ToLower()
+          $zip = (Get-FileHash ntpfix.zip -Algorithm SHA256).Hash.ToLower()
+          "dll=$dll" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "zip=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: ntpfix.zip
           generate_release_notes: true
+          body: |
+            ## Verifying this build
+
+            `ntpfix.dll` is installed into `System32` and loaded by the `w32time`
+            service, so verify it before you trust it. Both artifacts are signed
+            with GitHub build provenance. This proves the binary was produced by
+            this repo's release workflow from this exact commit, and not uploaded
+            by hand.
+
+            ```
+            gh attestation verify ntpfix.zip --repo ${{ github.repository }}
+            ```
+
+            Expand the zip and verify the DLL itself the same way:
+
+            ```
+            gh attestation verify ntpfix.dll --repo ${{ github.repository }}
+            ```
+
+            SHA256:
+
+            ```
+            ${{ steps.hashes.outputs.dll }}  ntpfix.dll
+            ${{ steps.hashes.outputs.zip }}  ntpfix.zip
+            ```
+
+            Prefer to build it yourself? It is one file and one command, see
+            [Building from source](https://github.com/${{ github.repository }}#building-from-source).
